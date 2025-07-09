@@ -40,12 +40,16 @@ class MessageProcessor {
         try {
             // 1. Verificar duplicação
             if (this.deduplicationService.isMessageProcessed(messageId)) {
-                logger.consumer('Skipping duplicate message', { messageId, queue });
-                // NÃO fazer ACK/NACK - mensagem já foi processada antes
-                // Fazer ACK/NACK causaria erro "unknown delivery tag"
+                logger.consumer('Skipping duplicate message - already processed', { 
+                    messageId, 
+                    queue, 
+                    deliveryTag: msg.fields.deliveryTag 
+                });
+                // ✅ IMPORTANTE: NÃO fazer ACK/NACK - mensagem já foi processada antes
+                // Fazer ACK/NACK causaria erro "unknown delivery tag" e fecharia o canal
                 this.stats.duplicates++;
                 this.stats.skipped++;
-                return { action: 'skip', reason: 'duplicate' };
+                return { action: 'skip', reason: 'duplicate', messageId };
             }
 
             // 2. Verificar se consumer está pausado

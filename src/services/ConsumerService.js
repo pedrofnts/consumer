@@ -211,6 +211,8 @@ class ConsumerService extends EventEmitter {
                 return;
             }
 
+            let messageProcessingResult = null;
+            
             try {
                 // Aplicar delay antes de processar
                 const currentInterval = this.queueIntervals.get(queueName);
@@ -219,7 +221,7 @@ class ConsumerService extends EventEmitter {
                 }
 
                 // Processar mensagem
-                const result = await this.messageProcessor.processMessage(msg, {
+                messageProcessingResult = await this.messageProcessor.processMessage(msg, {
                     queue: queueName,
                     webhook,
                     minInterval,
@@ -230,12 +232,12 @@ class ConsumerService extends EventEmitter {
 
                 // Atualizar estatísticas do consumer
                 consumerConfig.messageCount++;
-                if (result.messageContent) {
-                    consumerConfig.lastMessage = result.messageContent;
+                if (messageProcessingResult.messageContent) {
+                    consumerConfig.lastMessage = messageProcessingResult.messageContent;
                 }
 
                 // Definir próximo intervalo se mensagem foi processada com sucesso
-                if (result.action === 'ack' && result.reason === 'success') {
+                if (messageProcessingResult.action === 'ack' && messageProcessingResult.reason === 'success') {
                     this.queueIntervals.set(queueName, helpers.getRandomInterval(minInterval, maxInterval));
                     
                     // Não verificar fila vazia - desnecessário e causa problemas
@@ -243,15 +245,24 @@ class ConsumerService extends EventEmitter {
 
                 this.emit('messageProcessed', {
                     queue: queueName,
-                    result,
-                    messageId: result.messageId
+                    result: messageProcessingResult,
+                    messageId: messageProcessingResult.messageId
                 });
 
             } catch (error) {
                 logger.error('Error in message handler', error, { queue: queueName });
                 
-                // Tentar NACK, mas não se preocupar se falhar
-                await this.rabbitMQService.nackMessage(msg, false, true);
+                // ✅ CORREÇÃO: Não fazer NACK se mensagem foi skipada (duplicada)
+                // Isso evita o erro "unknown delivery tag" 
+                if (messageProcessingResult && messageProcessingResult.action === 'skip') {
+                    logger.debug('Skipping NACK for skipped message', { 
+                        queue: queueName, 
+                        reason: messageProcessingResult.reason 
+                    });
+                } else {
+                    // Tentar NACK apenas se mensagem não foi skipada
+                    await this.rabbitMQService.nackMessage(msg, false, true);
+                }
             }
         };
     }
@@ -369,12 +380,12 @@ class ConsumerService extends EventEmitter {
     }
 
     /**
-     * Inicia monitoramento periódico de saúde das filas - SIMPLIFICADO
+     * Inicia monitoramento periódico de saúde das filas - INTELIGENTE
      */
     startQueueHealthMonitoring() {
         // Verificar saúde das filas a cada 5 minutos - menos frequente
         this.healthCheckInterval = setInterval(async () => {
-            if (this.isShuttingDown || !this.isInitialized || !this.rabbitMQService.isChannelReady()) {
+            if (this.isShuttingDown || !this.isInitialized) {
                 return;
             }
 
@@ -383,12 +394,22 @@ class ConsumerService extends EventEmitter {
                 return;
             }
 
+            // ✅ MELHORIA: Verificar conectividade ANTES de fazer health check
+            if (!this.rabbitMQService.isChannelReady()) {
+                logger.consumer('Skipping health check - channel not ready, triggering reconnection check');
+                
+                // Disparar verificação de reconexão se canal não estiver pronto
+                this.rabbitMQService.emit('needsReconnection', new Error('Channel not ready during health check'));
+                return;
+            }
+
             logger.consumer('Running periodic queue health check', { activeQueues: activeQueues.length });
 
             let deletedQueues = 0;
             let healthyQueues = 0;
+            let connectionErrors = 0;
 
-            // Verificar cada fila ativa de forma simples
+            // Verificar cada fila ativa de forma mais inteligente
             for (const queueName of activeQueues) {
                 try {
                     await this.rabbitMQService.checkQueue(queueName);
@@ -396,6 +417,7 @@ class ConsumerService extends EventEmitter {
                 } catch (error) {
                     const errorMessage = error.message.toLowerCase();
                     
+                    // Filas deletadas externamente
                     if (errorMessage.includes('not_found') || 
                         errorMessage.includes('does not exist') || 
                         errorMessage.includes('no queue') ||
@@ -404,17 +426,44 @@ class ConsumerService extends EventEmitter {
                         logger.warn('Detected externally deleted queue during health check', { queue: queueName });
                         await this.handleExternallyDeletedQueue(queueName);
                         deletedQueues++;
-                    } else {
-                        // Outros erros - não fazer nada, deixar reconexão resolver
-                        logger.warn('Queue health check failed with connection error', { 
+                        
+                    // Erros de conectividade - parar health check e disparar reconexão
+                    } else if (errorMessage.includes('channel closed') || 
+                               errorMessage.includes('connection closed') ||
+                               errorMessage.includes('socket closed')) {
+                        
+                        logger.warn('Connection error detected during health check, stopping check and triggering reconnection', { 
                             queue: queueName, 
                             error: error.message 
                         });
+                        
+                        connectionErrors++;
+                        
+                        // ✅ MELHORIA: Disparar reconexão imediatamente e parar health check
+                        this.rabbitMQService.emit('needsReconnection', error);
+                        break; // Parar de verificar outras filas
+                        
+                    } else {
+                        // Outros erros - logar mas continuar
+                        logger.warn('Queue health check failed with unknown error', { 
+                            queue: queueName, 
+                            error: error.message 
+                        });
+                        connectionErrors++;
                     }
                 }
             }
 
-            if (deletedQueues > 0) {
+            // ✅ MELHORIA: Logging mais informativo
+            if (connectionErrors > 0) {
+                logger.consumer('Health check completed with connection errors', { 
+                    checkedQueues: activeQueues.length,
+                    healthyQueues,
+                    deletedQueues,
+                    connectionErrors,
+                    remainingActiveQueues: this.activeConsumers.size
+                });
+            } else if (deletedQueues > 0) {
                 logger.consumer('Health check completed with deleted queues', { 
                     checkedQueues: activeQueues.length,
                     healthyQueues,
@@ -606,7 +655,9 @@ class ConsumerService extends EventEmitter {
      * Trata reconexão bem-sucedida
      */
     async handleReconnectionSuccess() {
-        logger.consumer('Reconnection successful, reestablishing consumers...');
+        logger.consumer('Reconnection successful, reestablishing consumers...', {
+            consumerCount: this.activeConsumers.size
+        });
         
         const consumersToReestablish = Array.from(this.activeConsumers.entries());
         this.activeConsumers.clear();
@@ -665,7 +716,7 @@ class ConsumerService extends EventEmitter {
         logger.consumer('Consumer reestablishment completed', { 
             total: consumersToReestablish.length,
             reestablished, 
-            failed 
+            failed
         });
         
         this.emit('consumersReestablished', { 

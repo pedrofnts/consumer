@@ -13,6 +13,10 @@ class ReconnectionService extends EventEmitter {
         this.reconnectTimeout = null;
         this.shuttingDown = false;
         
+        // ✅ MELHORIA: Monitoramento proativo de conectividade
+        this.connectivityCheckInterval = null;
+        this.lastConnectivityCheck = 0;
+        
         // Configurações
         this.maxAttempts = config.reconnection.maxAttempts;
         this.baseDelay = config.reconnection.baseDelay;
@@ -21,6 +25,8 @@ class ReconnectionService extends EventEmitter {
         this.backoffMultiplier = config.reconnection.backoffMultiplier;
         
         this.setupEventHandlers();
+        // Monitoramento simples - só usar se necessário
+        // this.startConnectivityMonitoring();
     }
 
     /**
@@ -112,13 +118,20 @@ class ReconnectionService extends EventEmitter {
             return false;
         }
 
+        // ✅ MELHORIA: Se conexão está OK, não reconectar
+        if (this.rabbitMQService.isChannelReady()) {
+            logger.reconnection('Skipping reconnection: connection is healthy');
+            return false;
+        }
+
         const now = Date.now();
         const timeSinceLastReconnect = now - this.lastReconnectTime;
         
         if (timeSinceLastReconnect < this.debounceMs) {
             logger.reconnection('Skipping reconnection: debounce active', {
                 timeSinceLastMs: timeSinceLastReconnect,
-                debounceMs: this.debounceMs
+                debounceMs: this.debounceMs,
+                channelReady: this.rabbitMQService.isChannelReady()
             });
             return false;
         }
@@ -294,6 +307,12 @@ class ReconnectionService extends EventEmitter {
             shuttingDown: this.shuttingDown,
             timeSinceLastReconnectMs: Date.now() - this.lastReconnectTime,
             hasScheduledReconnection: !!this.reconnectTimeout,
+            // ✅ NOVO: Estatísticas do monitoramento proativo
+            proactiveMonitoring: {
+                enabled: !!this.connectivityCheckInterval,
+                lastCheck: this.lastConnectivityCheck,
+                timeSinceLastCheckMs: this.lastConnectivityCheck ? Date.now() - this.lastConnectivityCheck : null
+            },
             config: {
                 baseDelay: this.baseDelay,
                 maxDelay: this.maxDelay,
@@ -304,10 +323,54 @@ class ReconnectionService extends EventEmitter {
     }
 
     /**
+     * ✅ NOVO: Inicia monitoramento proativo de conectividade
+     */
+    startConnectivityMonitoring() {
+        // Verificar conectividade a cada 30 segundos
+        this.connectivityCheckInterval = setInterval(() => {
+            this.checkConnectivity();
+        }, 30000);
+        
+        logger.reconnection('Started proactive connectivity monitoring');
+    }
+
+    /**
+     * ✅ NOVO: Verifica conectividade proativamente
+     */
+    checkConnectivity() {
+        if (this.shuttingDown || this.isReconnecting) {
+            return;
+        }
+
+        const now = Date.now();
+        this.lastConnectivityCheck = now;
+
+        // Se conexão não está pronta, tentar reconectar
+        if (!this.rabbitMQService.isChannelReady()) {
+            logger.reconnection('Proactive connectivity check failed - channel not ready');
+            this.scheduleReconnection('proactive-check');
+        }
+    }
+
+    /**
+     * ✅ NOVO: Para monitoramento de conectividade
+     */
+    stopConnectivityMonitoring() {
+        if (this.connectivityCheckInterval) {
+            clearInterval(this.connectivityCheckInterval);
+            this.connectivityCheckInterval = null;
+            logger.reconnection('Stopped proactive connectivity monitoring');
+        }
+    }
+
+    /**
      * Shutdown graceful do serviço
      */
     async shutdown() {
         logger.reconnection('Shutting down reconnection service');
+        
+        // ✅ MELHORIA: Parar monitoramento proativo
+        this.stopConnectivityMonitoring();
         
         this.stopReconnectionAttempts();
         this.removeAllListeners();

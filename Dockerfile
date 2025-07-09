@@ -17,8 +17,9 @@ RUN npm install --only=production && \
 # Copy application code
 COPY . .
 
-# Change ownership to nodejs user
-RUN chown -R nodejs:nodejs /app
+# Create data directory with correct permissions
+RUN mkdir -p /app/data && \
+    chown -R nodejs:nodejs /app
 
 # Switch to non-root user
 USER nodejs

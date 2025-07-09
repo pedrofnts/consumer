@@ -71,7 +71,19 @@ class DeduplicationService {
      */
     isMessageProcessed(messageId) {
         if (!messageId) return false;
-        return this.processedMessages.has(messageId);
+        
+        const isProcessed = this.processedMessages.has(messageId);
+        
+        // ✅ Log detalhado para debug de duplicação
+        if (isProcessed) {
+            logger.debug('Duplicate message detected', { 
+                messageId,
+                totalProcessed: this.processedMessages.size,
+                isCurrentlyProcessing: this.processingMessages.has(messageId)
+            });
+        }
+        
+        return isProcessed;
     }
 
     /**

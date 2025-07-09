@@ -95,21 +95,41 @@ class RabbitMQService extends EventEmitter {
      * Executa operação no canal de forma segura
      */
     async safeChannelOperation(operation, errorMessage = 'Channel operation failed') {
+        // ✅ MELHORIA: Verificação proativa antes da operação
         if (!this.isChannelReady()) {
-            throw new Error('Channel not ready');
+            const channelError = new Error('Channel not ready');
+            logger.debug('Channel not ready for operation', { 
+                operation: errorMessage,
+                connectionClosed: this.connection?.closed,
+                channelClosed: this.channel?.closed
+            });
+            
+            // Disparar verificação de reconexão se canal não estiver pronto
+            setImmediate(() => this.emit('needsReconnection', channelError));
+            throw channelError;
         }
 
         try {
             return await operation();
         } catch (error) {
-            // Só logar se não for erro de delivery tag (muito comum)
-            if (!error.message.includes('delivery tag')) {
+            // ✅ MELHORIA: Logging mais inteligente
+            if (error.message.includes('delivery tag')) {
+                // Erro de delivery tag já tratado em outro lugar
+                logger.debug('Delivery tag error (handled safely)', { 
+                    operation: errorMessage, 
+                    error: error.message 
+                });
+            } else {
                 logger.error(errorMessage, error);
             }
             
             // Detectar erros específicos que requerem reconexão
             if (this._shouldTriggerReconnection(error)) {
-                this.emit('needsReconnection', error);
+                logger.warn('Operation error requires reconnection', { 
+                    operation: errorMessage, 
+                    error: error.message 
+                });
+                setImmediate(() => this.emit('needsReconnection', error));
             }
             
             throw error;
@@ -133,7 +153,9 @@ class RabbitMQService extends EventEmitter {
         
         // Erros específicos do protocolo AMQP que afetam o canal
         const protocolErrors = [
-            error.code === 406 && error.message.includes('delivery tag'), // PRECONDITION_FAILED com delivery tag
+            // ✅ CORREÇÃO: Delivery tag duplicado NÃO deve disparar reconexão
+            // É comportamento normal quando mensagens duplicadas são detectadas
+            // error.code === 406 && error.message.includes('delivery tag'), 
             error.code === 504, // CHANNEL_ERROR
             error.code === 505, // UNEXPECTED_FRAME
             error.code === 506  // RESOURCE_ERROR
@@ -203,8 +225,16 @@ class RabbitMQService extends EventEmitter {
                 this.channel.ack(msg);
             }
         } catch (error) {
-            // Não logar erro de ACK - apenas silenciar para evitar spam
-            // Channel provavelmente já está fechado
+            // ✅ Proteção específica para delivery tag já usado
+            if (error.code === 406 && error.message.includes('delivery tag')) {
+                logger.debug('ACK ignored: delivery tag already used', { 
+                    deliveryTag: msg.fields?.deliveryTag,
+                    error: error.message 
+                });
+                return; // Não propagar erro nem disparar reconexão
+            }
+            
+            // Outros erros são tratados normalmente (channel fechado, etc.)
         }
     }
 
@@ -219,8 +249,16 @@ class RabbitMQService extends EventEmitter {
                 this.channel.nack(msg, allUpTo, requeue);
             }
         } catch (error) {
-            // Não logar erro de NACK - apenas silenciar para evitar spam
-            // Channel provavelmente já está fechado
+            // ✅ Proteção específica para delivery tag já usado
+            if (error.code === 406 && error.message.includes('delivery tag')) {
+                logger.debug('NACK ignored: delivery tag already used', { 
+                    deliveryTag: msg.fields?.deliveryTag,
+                    error: error.message 
+                });
+                return; // Não propagar erro nem disparar reconexão
+            }
+            
+            // Outros erros são tratados normalmente (channel fechado, etc.)
         }
     }
 
