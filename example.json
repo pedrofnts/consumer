@@ -1,0 +1,8 @@
+curl -X POST http://localhost:3000/consume \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "9c779417-e82b-464b-824a-6b67ae6ace98",
+    "webhook": "https://webhook.site/b9d962da-bc86-4524-9e76-f69f10e0f9ac",
+    "minInterval": 30000,
+    "maxInterval": 60000
+  }'
